@@ -4,34 +4,55 @@ import matplotlib.pyplot as plt
 from dynamics_learner.gp import SlidingWindowGP
 from dynamics_learner.nn import ResidualNN
 
-# ---------- Hybrid wrapper ----------
-class HybridResidual:
-    def __init__(self, x_dim, u_dim, r_dim, alpha=0.5, gp_kwargs=None, nn_kwargs=None):
-        self.alpha = float(alpha)
-        self.gp = SlidingWindowGP(x_dim=x_dim, u_dim=u_dim, r_dim=r_dim, **(gp_kwargs or {}))
-        self.nn = ResidualNN(x_dim=x_dim, u_dim=u_dim, r_dim=r_dim, **(nn_kwargs or {}))
 
-    def update(self, batch):
-        self.gp.update(batch)
-        self.nn.update(batch)
+# -------------------- Data utils --------------------
+def load_pendubot(path="pendubot_residuals.npy"):
+    """
+    Expects npy saved as an array/list of (x, u, r) tuples.
+    x: [x_dim], u: [u_dim], r: [r_dim]
+    Returns:
+      inputs = [N, x_dim+u_dim], targets = [N, r_dim]
+    """
+    data = np.load(path, allow_pickle=True)
+    X, U, R = [], [], []
+    for (x, u, r) in data:
+        X.append(np.asarray(x, dtype=float).ravel())
+        U.append(np.asarray(u, dtype=float).ravel())
+        R.append(np.asarray(r, dtype=float).ravel())
+    X = np.asarray(X, dtype=float)
+    U = np.asarray(U, dtype=float)
+    R = np.asarray(R, dtype=float)
+    inputs = np.concatenate([X, U], axis=1)
+    targets = R
+    return inputs, targets
 
-    def predict(self, x, u):
-        mg, vg = self.gp.predict(x, u)
-        mn, vn = self.nn.predict(x, u)
-        mean = self.alpha * mg + (1.0 - self.alpha) * mn
-        var  = self.alpha * vg + (1.0 - self.alpha) * vn
-        return mean, var
+
+def chronological_split(X, Y, train_ratio=0.7):
+    N = len(X)
+    ntr = int(train_ratio * N)
+    return X[:ntr], X[ntr:], Y[:ntr], Y[ntr:]
 
 
-# ---------- Fake residual generator ----------
-def fake_residual(x, u):
-    return 0.5 * np.asarray(x) + 0.1 * np.asarray(u) + 0.01 * np.random.randn(len(x))
+def standardize_train_test(train_in, test_in, train_out, test_out):
+    in_mean, in_std = train_in.mean(0), train_in.std(0) + 1e-8
+    out_mean, out_std = train_out.mean(0), train_out.std(0) + 1e-8
+
+    train_in_n = (train_in - in_mean) / in_std
+    test_in_n  = (test_in  - in_mean) / in_std
+    train_out_n = (train_out - out_mean) / out_std
+    test_out_n  = (test_out  - out_mean) / out_std
+
+    stats = {"in_mean": in_mean, "in_std": in_std, "out_mean": out_mean, "out_std": out_std}
+    return train_in_n, test_in_n, train_out_n, test_out_n, stats
 
 
-# ---------- Rolling metric ----------
-def rolling_metric(y_true, y_pred, window=20, metric="mse"):
+def denorm(y, mean, std):
+    return y * std + mean
+
+
+def rolling_metric(y_true, y_pred, window=30, metric="mse"):
     y_true, y_pred = np.asarray(y_true), np.asarray(y_pred)
-    T, D = y_true.shape
+    T = y_true.shape[0]
     out = np.zeros(T)
     for t in range(T):
         s = max(0, t - window + 1)
@@ -45,90 +66,126 @@ def rolling_metric(y_true, y_pred, window=20, metric="mse"):
     return out
 
 
-# ---------- Main experiment ----------
+# -------------------- Hybrid (uncertainty-weighted) --------------------
+def fuse_uncertainty(mean_gp, var_gp, mean_nn, var_nn, eps=1e-6):
+    """
+    Per-dimension inverse-variance weighting.
+    mean = (m_g/σ_g^2 + m_n/σ_n^2) / (1/σ_g^2 + 1/σ_n^2)
+    var  = 1 / (1/σ_g^2 + 1/σ_n^2)
+    """
+    w_gp = 1.0 / (np.asarray(var_gp) + eps)
+    w_nn = 1.0 / (np.asarray(var_nn) + eps)
+    wsum = w_gp + w_nn
+    mean = (w_gp * mean_gp + w_nn * mean_nn) / wsum
+    var = 1.0 / wsum
+    return mean, var
+
+
+# -------------------- Main --------------------
 def main():
-    rng = np.random.default_rng(0)
-    x_dim, u_dim, r_dim = 4, 1, 4
-    T = 400
-    train_every = 32
-    roll_window = 25
-    compare_dim = 0
+    # ---------- Load & split ----------
+    inputs, targets = load_pendubot("pendubot_residuals.npy")
+    x_dim = inputs.shape[1] - 1  # (pendubot: 4 states + 1 input)
+    u_dim = 1
+    r_dim = targets.shape[1]
 
-    gp = SlidingWindowGP(x_dim=x_dim, u_dim=u_dim, r_dim=r_dim, maxlen=200)
-    nn = ResidualNN(x_dim=x_dim, u_dim=u_dim, r_dim=r_dim)
-    hybrid = HybridResidual(x_dim=x_dim, u_dim=u_dim, r_dim=r_dim, alpha=0.5)
+    train_in, test_in, train_out, test_out = chronological_split(inputs, targets, train_ratio=0.7)
+    (train_in_n, test_in_n, train_out_n, test_out_n, stats) = standardize_train_test(
+        train_in, test_in, train_out, test_out
+    )
+    out_mean, out_std = stats["out_mean"], stats["out_std"]
 
-    truths, gp_means, nn_means, hy_means = [], [], [], []
-    batch = []
+    # ---------- Instantiate learners ----------
+    gp = SlidingWindowGP(x_dim=x_dim, u_dim=u_dim, r_dim=r_dim,
+                         maxlen=300, lengthscale=1.0, variance=1.0, noise_variance=1e-3)
 
-    for t in range(T):
-        x = rng.standard_normal(x_dim)
-        u = rng.standard_normal(u_dim)
-        r = fake_residual(x, u)
-        batch.append((x, u, r))
+    nn = ResidualNN(x_dim=x_dim, u_dim=u_dim, r_dim=r_dim,
+                    hidden=(256, 128, 64), dropout=0.15, lr=3e-4, weight_decay=1e-4)
 
-        if len(batch) >= train_every:
-            gp.update(batch)
-            nn.update(batch)
-            hybrid.update(batch)
-            batch = []
+    # ---------- Train (chronological) ----------
+    for i in range(len(train_in_n)):
+        x = train_in_n[i, :x_dim]
+        u = train_in_n[i, x_dim:]
+        r = train_out_n[i]
+        gp.update([(x, u, r)])
 
-        mg, _ = gp.predict(x, u)
-        mn, _ = nn.predict(x, u)
-        mh, _ = hybrid.predict(x, u)
+    nn_batch = [(train_in_n[i, :x_dim], train_in_n[i, x_dim:], train_out_n[i])
+                for i in range(len(train_in_n))]
+    nn.update(nn_batch, epochs=120, patience=15, batch_size=64)
 
-        truths.append(r)
-        gp_means.append(mg)
-        nn_means.append(mn)
-        hy_means.append(mh)
+    # ---------- Evaluate on test ----------
+    def run_model_means_and_vars(model):
+        means, vars_ = [], []
+        for i in range(len(test_in_n)):
+            x = test_in_n[i, :x_dim]
+            u = test_in_n[i, x_dim:]
+            m, v = model.predict(x, u)
+            means.append(m)
+            vars_.append(v)
+        return np.asarray(means), np.asarray(vars_)
 
-    truths, gp_means, nn_means, hy_means = map(np.array, (truths, gp_means, nn_means, hy_means))
+    gp_means_n, gp_vars_n = run_model_means_and_vars(gp)
+    nn_means_n, nn_vars_n = run_model_means_and_vars(nn)
 
-    # Rolling metrics
-    gp_mse = rolling_metric(truths, gp_means, roll_window, "mse")
-    nn_mse = rolling_metric(truths, nn_means, roll_window, "mse")
-    hy_mse = rolling_metric(truths, hy_means, roll_window, "mse")
+    hy_means_n, hy_vars_n = [], []
+    for i in range(len(test_in_n)):
+        m_f, v_f = fuse_uncertainty(gp_means_n[i], gp_vars_n[i], nn_means_n[i], nn_vars_n[i])
+        hy_means_n.append(m_f); hy_vars_n.append(v_f)
+    hy_means_n = np.asarray(hy_means_n)
 
-    gp_mae = rolling_metric(truths, gp_means, roll_window, "mae")
-    nn_mae = rolling_metric(truths, nn_means, roll_window, "mae")
-    hy_mae = rolling_metric(truths, hy_means, roll_window, "mae")
+    gp_means = denorm(gp_means_n, out_mean, out_std)
+    nn_means = denorm(nn_means_n, out_mean, out_std)
+    hy_means = denorm(hy_means_n, out_mean, out_std)
+    truths   = denorm(test_out_n, out_mean, out_std)
 
-    # Summary numbers
+    # ---------- Metrics ----------
     def summary(name, pred):
-        mse = np.mean((pred - truths) ** 2)
-        mae = np.mean(np.abs(pred - truths))
+        mse = float(np.mean((pred - truths) ** 2))
+        mae = float(np.mean(np.abs(pred - truths)))
         print(f"{name}: MSE={mse:.6f}, MAE={mae:.6f}")
 
-    print("==== Overall Performance ====")
+    print("==== Test (de-normalized) ====")
     summary("GP", gp_means)
     summary("NN", nn_means)
-    summary("Hybrid", hy_means)
+    summary("Hybrid (uncertainty-weighted)", hy_means)
+
+    # ---------- Rolling curves ----------
+    T = len(truths)
+    t = np.arange(T)
+    roll_w = max(25, T // 6)
+    gp_mse = rolling_metric(truths, gp_means, roll_w, "mse")
+    nn_mse = rolling_metric(truths, nn_means, roll_w, "mse")
+    hy_mse = rolling_metric(truths, hy_means, roll_w, "mse")
+    gp_mae = rolling_metric(truths, gp_means, roll_w, "mae")
+    nn_mae = rolling_metric(truths, nn_means, roll_w, "mae")
+    hy_mae = rolling_metric(truths, hy_means, roll_w, "mae")
 
     # ---------- Plots ----------
-    t = np.arange(T)
-
-    plt.figure(figsize=(11, 4))
-    plt.plot(t, truths[:, compare_dim], label="True residual", color="black")
-    plt.plot(t, gp_means[:, compare_dim], label="GP")
-    plt.plot(t, nn_means[:, compare_dim], label="NN")
-    plt.plot(t, hy_means[:, compare_dim], label="Hybrid", linestyle="--")
-    plt.title(f"Residual tracking (dim {compare_dim})")
+    # Residual tracking only for dim 0
+    plt.figure(figsize=(12, 4))
+    plt.plot(t, truths[:, 0], label="True residual (dim 0)")
+    plt.plot(t, gp_means[:, 0], label="GP")
+    plt.plot(t, nn_means[:, 0], label="NN")
+    plt.plot(t, hy_means[:, 0], label="Hybrid (UW)", linestyle="--")
+    plt.title("Residual tracking (dim 0)")
     plt.legend()
     plt.tight_layout()
 
-    plt.figure(figsize=(11, 4))
+    # Rolling MSE
+    plt.figure(figsize=(12, 4))
     plt.plot(t, gp_mse, label="GP")
     plt.plot(t, nn_mse, label="NN")
-    plt.plot(t, hy_mse, label="Hybrid")
-    plt.title("Rolling MSE")
+    plt.plot(t, hy_mse, label="Hybrid (UW)")
+    plt.title("Rolling MSE (de-normalized)")
     plt.legend()
     plt.tight_layout()
 
-    plt.figure(figsize=(11, 4))
+    # Rolling MAE
+    plt.figure(figsize=(12, 4))
     plt.plot(t, gp_mae, label="GP")
     plt.plot(t, nn_mae, label="NN")
-    plt.plot(t, hy_mae, label="Hybrid")
-    plt.title("Rolling MAE")
+    plt.plot(t, hy_mae, label="Hybrid (UW)")
+    plt.title("Rolling MAE (de-normalized)")
     plt.legend()
     plt.tight_layout()
 
