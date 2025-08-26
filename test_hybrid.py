@@ -1,6 +1,7 @@
 import numpy as np
 import matplotlib.pyplot as plt
-
+from matplotlib.backends.backend_pdf import PdfPages
+from matplotlib.figure import Figure
 from dynamics_learner.gp import SlidingWindowGP
 from dynamics_learner.nn import ResidualNN
 
@@ -67,18 +68,18 @@ def rolling_metric(y_true, y_pred, window=30, metric="mse"):
 
 
 # -------------------- Hybrid (uncertainty-weighted) --------------------
-def fuse_uncertainty(mean_gp, var_gp, mean_nn, var_nn, eps=1e-6):
-    """
-    Per-dimension inverse-variance weighting.
-    mean = (m_g/σ_g^2 + m_n/σ_n^2) / (1/σ_g^2 + 1/σ_n^2)
-    var  = 1 / (1/σ_g^2 + 1/σ_n^2)
-    """
-    w_gp = 1.0 / (np.asarray(var_gp) + eps)
-    w_nn = 1.0 / (np.asarray(var_nn) + eps)
-    wsum = w_gp + w_nn
-    mean = (w_gp * mean_gp + w_nn * mean_nn) / wsum
-    var = 1.0 / wsum
-    return mean, var
+# def fuse_uncertainty(mean_gp, var_gp, mean_nn, var_nn, eps=1e-6):
+#     """
+#     Per-dimension inverse-variance weighting.
+#     mean = (m_g/σ_g^2 + m_n/σ_n^2) / (1/σ_g^2 + 1/σ_n^2)
+#     var  = 1 / (1/σ_g^2 + 1/σ_n^2)
+#     """
+#     w_gp = 1.0 / (np.asarray(var_gp) + eps)
+#     w_nn = 1.0 / (np.asarray(var_nn) + eps)
+#     wsum = w_gp + w_nn
+#     mean = (w_gp * mean_gp + w_nn * mean_nn) / wsum
+#     var = 1.0 / wsum
+#     return mean, var
 
 
 # -------------------- Main --------------------
@@ -127,15 +128,15 @@ def main():
     gp_means_n, gp_vars_n = run_model_means_and_vars(gp)
     nn_means_n, nn_vars_n = run_model_means_and_vars(nn)
 
-    hy_means_n, hy_vars_n = [], []
-    for i in range(len(test_in_n)):
-        m_f, v_f = fuse_uncertainty(gp_means_n[i], gp_vars_n[i], nn_means_n[i], nn_vars_n[i])
-        hy_means_n.append(m_f); hy_vars_n.append(v_f)
-    hy_means_n = np.asarray(hy_means_n)
+    # hy_means_n, hy_vars_n = [], []
+    # for i in range(len(test_in_n)):
+    #     m_f, v_f = fuse_uncertainty(gp_means_n[i], gp_vars_n[i], nn_means_n[i], nn_vars_n[i])
+    #     hy_means_n.append(m_f); hy_vars_n.append(v_f)
+    # hy_means_n = np.asarray(hy_means_n)
 
     gp_means = denorm(gp_means_n, out_mean, out_std)
     nn_means = denorm(nn_means_n, out_mean, out_std)
-    hy_means = denorm(hy_means_n, out_mean, out_std)
+    # hy_means = denorm(hy_means_n, out_mean, out_std)
     truths   = denorm(test_out_n, out_mean, out_std)
 
     # ---------- Metrics ----------
@@ -147,7 +148,7 @@ def main():
     print("==== Test (de-normalized) ====")
     summary("GP", gp_means)
     summary("NN", nn_means)
-    summary("Hybrid (uncertainty-weighted)", hy_means)
+    # summary("Hybrid (uncertainty-weighted)", hy_means)
 
     # ---------- Rolling curves ----------
     T = len(truths)
@@ -155,41 +156,63 @@ def main():
     roll_w = max(25, T // 6)
     gp_mse = rolling_metric(truths, gp_means, roll_w, "mse")
     nn_mse = rolling_metric(truths, nn_means, roll_w, "mse")
-    hy_mse = rolling_metric(truths, hy_means, roll_w, "mse")
+    # hy_mse = rolling_metric(truths, hy_means, roll_w, "mse")
     gp_mae = rolling_metric(truths, gp_means, roll_w, "mae")
     nn_mae = rolling_metric(truths, nn_means, roll_w, "mae")
-    hy_mae = rolling_metric(truths, hy_means, roll_w, "mae")
+    # hy_mae = rolling_metric(truths, hy_means, roll_w, "mae")
 
     # ---------- Plots ----------
     # Residual tracking only for dim 0
-    plt.figure(figsize=(12, 4))
-    plt.plot(t, truths[:, 0], label="True residual (dim 0)")
-    plt.plot(t, gp_means[:, 0], label="GP")
-    plt.plot(t, nn_means[:, 0], label="NN")
-    plt.plot(t, hy_means[:, 0], label="Hybrid (UW)", linestyle="--")
-    plt.title("Residual tracking (dim 0)")
-    plt.legend()
-    plt.tight_layout()
+    # ---------- Save results to PDF ----------
+    with PdfPages("results.pdf") as pdf:
+        # Residual tracking only for dim 0
+        plt.figure(figsize=(12, 4))
+        plt.plot(t, truths[:, 0], label="True residual (dim 0)")
+        plt.plot(t, gp_means[:, 0], label="GP")
+        plt.plot(t, nn_means[:, 0], label="NN")
+        plt.title("Residual tracking (dim 0)")
+        plt.legend()
+        plt.tight_layout()
+        pdf.savefig()
+        plt.close()
 
-    # Rolling MSE
-    plt.figure(figsize=(12, 4))
-    plt.plot(t, gp_mse, label="GP")
-    plt.plot(t, nn_mse, label="NN")
-    plt.plot(t, hy_mse, label="Hybrid (UW)")
-    plt.title("Rolling MSE (de-normalized)")
-    plt.legend()
-    plt.tight_layout()
+        # Rolling MSE
+        plt.figure(figsize=(12, 4))
+        plt.plot(t, gp_mse, label="GP")
+        plt.plot(t, nn_mse, label="NN")
+        plt.title("Rolling MSE (de-normalized)")
+        plt.legend()
+        plt.tight_layout()
+        pdf.savefig()
+        plt.close()
 
-    # Rolling MAE
-    plt.figure(figsize=(12, 4))
-    plt.plot(t, gp_mae, label="GP")
-    plt.plot(t, nn_mae, label="NN")
-    plt.plot(t, hy_mae, label="Hybrid (UW)")
-    plt.title("Rolling MAE (de-normalized)")
-    plt.legend()
-    plt.tight_layout()
+        # Rolling MAE
+        plt.figure(figsize=(12, 4))
+        plt.plot(t, gp_mae, label="GP")
+        plt.plot(t, nn_mae, label="NN")
+        plt.title("Rolling MAE (de-normalized)")
+        plt.legend()
+        plt.tight_layout()
+        pdf.savefig()
+        plt.close()
 
-    plt.show()
+        # Add a summary text page
+        fig = Figure(figsize=(8.5, 6))
+        ax = fig.add_subplot(111)
+        ax.axis("off")
+        text = (
+            "==== Test Results (de-normalized) ====\n"
+            f"GP:  MSE={np.mean((gp_means - truths)**2):.6f}, "
+            f"MAE={np.mean(np.abs(gp_means - truths)):.6f}\n"
+            f"NN:  MSE={np.mean((nn_means - truths)**2):.6f}, "
+            f"MAE={np.mean(np.abs(nn_means - truths)):.6f}\n"
+        )
+        ax.text(0.05, 0.95, text, va="top", ha="left", fontsize=12)
+        pdf.savefig(fig)
+        plt.close(fig)
+
+    print(" Results saved to results.pdf")
+
 
 
 if __name__ == "__main__":
